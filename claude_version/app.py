@@ -10,6 +10,7 @@ st.set_page_config(page_title="Rule Waterfall Analyzer", layout="wide")
 # Helper Functions
 # ================================================================
 
+
 @st.cache_data
 def load_parquet(file_bytes):
     return pd.read_parquet(BytesIO(file_bytes))
@@ -20,7 +21,9 @@ def generate_dummy_data(n_records=100_000, n_rules=20):
     np.random.seed(42)
     dates = pd.date_range("2022-01-01", "2024-12-31", periods=n_records)
     data = {
-        "application_date": np.sort(np.random.choice(dates, n_records, replace=True)),
+        "application_date": np.sort(
+            np.random.choice(dates, n_records, replace=True)
+        ),
         "region": np.random.choice(["East", "West", "North", "South"], n_records),
         "product": np.random.choice(
             ["Personal Loan", "Auto Loan", "Mortgage", "Credit Card"], n_records
@@ -36,6 +39,11 @@ def generate_dummy_data(n_records=100_000, n_rules=20):
     rule_sum = sum(data[f"rule_{i:03d}"] for i in range(1, n_rules + 1))
     bad_prob = 1 / (1 + np.exp(-(rule_sum / n_rules * 4 - 2)))
     data["bad_flag"] = (np.random.random(n_records) < bad_prob).astype(int)
+
+    # Also create aggregated-friendly columns for testing
+    data["record_count"] = np.ones(n_records, dtype=int)
+    data["bad_count"] = data["bad_flag"].copy()
+
     return pd.DataFrame(data)
 
 
@@ -50,9 +58,9 @@ def detect_column_types(df):
         if vals and vals.issubset({0, 1, 0.0, 1.0, True, False}):
             rule_cols.append(col)
             continue
-        if pd.api.types.is_object_dtype(df[col]) or pd.api.types.is_categorical_dtype(
+        if pd.api.types.is_object_dtype(
             df[col]
-        ):
+        ) or pd.api.types.is_categorical_dtype(df[col]):
             try:
                 sample = df[col].dropna().head(50)
                 if len(sample) > 0:
@@ -90,6 +98,48 @@ def filter_by_categories(df, cat_filters):
     return df[mask]
 
 
+def render_cat_filters(cat_cols, df, key_prefix):
+    """Render categorical filter widgets inline; return {col: [selected_vals]}."""
+    cat_filters = {}
+    if not cat_cols:
+        return cat_filters
+    with st.expander("Categorical Filters", expanded=False):
+        n_per_row = 3
+        for start in range(0, len(cat_cols), n_per_row):
+            chunk = cat_cols[start : start + n_per_row]
+            row = st.columns(len(chunk))
+            for j, col in enumerate(chunk):
+                with row[j]:
+                    uv = sorted(df[col].dropna().unique().tolist())
+                    sel = st.multiselect(col, uv, key=f"{key_prefix}_{col}")
+                    if sel:
+                        cat_filters[col] = sel
+    return cat_filters
+
+
+def render_date_filter(date_cols, df, key_prefix):
+    """Render date filter (column selector + year + quarter). Returns (col, years, quarters)."""
+    fc1, fc2, fc3 = st.columns(3)
+    with fc1:
+        options = ["(None)"] + date_cols
+        dc = st.selectbox("Date column", options, key=f"{key_prefix}_dc")
+        date_col = None if dc == "(None)" else dc
+    years, quarters = [], []
+    if date_col:
+        dt_s = pd.to_datetime(df[date_col])
+        with fc2:
+            years = st.multiselect(
+                "Year(s)",
+                sorted(dt_s.dt.year.dropna().unique()),
+                key=f"{key_prefix}_yr",
+            )
+        with fc3:
+            quarters = st.multiselect(
+                "Quarter(s)", [1, 2, 3, 4], key=f"{key_prefix}_qt"
+            )
+    return date_col, years, quarters
+
+
 def compute_waterfall(df, ordered_groups, weight_col=None):
     w = df[weight_col].values.astype(float) if weight_col else np.ones(len(df))
     total = w.sum()
@@ -101,11 +151,7 @@ def compute_waterfall(df, ordered_groups, weight_col=None):
         hit = df[rules].fillna(0).values.astype(bool).any(axis=1) & remaining
         cnt = (hit * w).sum()
         results.append(
-            {
-                "group": name,
-                "count": cnt,
-                "pct": cnt / total * 100 if total else 0,
-            }
+            {"group": name, "count": cnt, "pct": cnt / total * 100 if total else 0}
         )
         remaining &= ~hit
     approved = (remaining * w).sum()
@@ -119,41 +165,52 @@ def compute_waterfall(df, ordered_groups, weight_col=None):
     return results, total
 
 
-def compute_bad_rates(df, ordered_groups, bad_col, weight_col=None):
-    w = df[weight_col].values.astype(float) if weight_col else np.ones(len(df))
-    b = df[bad_col].fillna(0).values.astype(float)
+def compute_bad_rates(df, ordered_groups, numerator_col, denominator_col=None):
+    """
+    Compute bad rate per waterfall segment.
+
+    numerator_col : column whose sum = "bads" in each segment.
+    denominator_col : column whose sum = "total" in each segment.
+                      If None every row counts as 1 (row-level data).
+    """
+    n = df[numerator_col].fillna(0).values.astype(float)
+    d = (
+        df[denominator_col].fillna(0).values.astype(float)
+        if denominator_col
+        else np.ones(len(df))
+    )
     remaining = np.ones(len(df), dtype=bool)
     results = []
     for name, rules in ordered_groups:
         if not rules:
             continue
         hit = df[rules].fillna(0).values.astype(bool).any(axis=1) & remaining
-        seg_total = (hit * w).sum()
-        seg_bads = (hit * b).sum()
+        seg_num = (hit * n).sum()
+        seg_den = (hit * d).sum()
         results.append(
             {
                 "group": name,
-                "total": seg_total,
-                "bads": seg_bads,
-                "bad_rate": seg_bads / seg_total * 100 if seg_total else 0,
+                "numerator": seg_num,
+                "denominator": seg_den,
+                "bad_rate": seg_num / seg_den * 100 if seg_den else 0,
             }
         )
         remaining &= ~hit
-    seg_total = (remaining * w).sum()
-    seg_bads = (remaining * b).sum()
+    seg_num = (remaining * n).sum()
+    seg_den = (remaining * d).sum()
     results.append(
         {
             "group": "Approved",
-            "total": seg_total,
-            "bads": seg_bads,
-            "bad_rate": seg_bads / seg_total * 100 if seg_total else 0,
+            "numerator": seg_num,
+            "denominator": seg_den,
+            "bad_rate": seg_num / seg_den * 100 if seg_den else 0,
         }
     )
     return results
 
 
 def plot_waterfall(results, total_pop, mode="absolute"):
-    n_decline = len(results) - 1  # everything except Approved
+    n_decline = len(results) - 1
     labels = (
         ["Total Population"]
         + [r["group"] for r in results[:n_decline]]
@@ -200,7 +257,7 @@ def plot_waterfall(results, total_pop, mode="absolute"):
     return fig
 
 
-def plot_bad_rates(results):
+def plot_bad_rates(results, numerator_label, denominator_label):
     df_br = pd.DataFrame(results)
     colors = ["#EF553B"] * (len(df_br) - 1) + ["#00CC96"]
     fig = go.Figure(
@@ -213,7 +270,7 @@ def plot_bad_rates(results):
         )
     )
     fig.update_layout(
-        title="Bad Rate by Waterfall Segment",
+        title=f"Bad Rate by Segment  ({numerator_label} / {denominator_label})",
         yaxis_title="Bad Rate (%)",
         height=500,
     )
@@ -227,11 +284,13 @@ if "groups" not in st.session_state:
     st.session_state.groups = []
 
 # ================================================================
-# Sidebar
+# Sidebar – Data Source & Column Configuration
 # ================================================================
 with st.sidebar:
     st.header("Data Source")
-    data_source = st.radio("Choose data source:", ["Upload Parquet", "Use Dummy Data"])
+    data_source = st.radio(
+        "Choose data source:", ["Upload Parquet", "Use Dummy Data"]
+    )
 
     if data_source == "Upload Parquet":
         uploaded = st.file_uploader("Upload a Parquet file", type=["parquet"])
@@ -243,23 +302,29 @@ with st.sidebar:
             )
     else:
         c1, c2 = st.columns(2)
-        n_records = c1.number_input("Records", 1_000, 3_000_000, 100_000, step=10_000)
+        n_records = c1.number_input(
+            "Records", 1_000, 3_000_000, 100_000, step=10_000
+        )
         n_rules = c2.number_input("Rules", 5, 200, 20)
         if st.button("Generate Dummy Data", use_container_width=True):
-            st.session_state["df"] = generate_dummy_data(int(n_records), int(n_rules))
+            st.session_state["df"] = generate_dummy_data(
+                int(n_records), int(n_rules)
+            )
             st.session_state.groups = []
-            st.success(f"Generated {int(n_records):,} rows, {int(n_rules)} rules")
+            st.success(
+                f"Generated {int(n_records):,} rows, {int(n_rules)} rules"
+            )
 
 df = st.session_state.get("df")
 
-# Column configuration & filters (only when data is loaded)
+# Defaults (overwritten below when df is loaded)
 date_cols = []
 rule_cols = []
 cat_cols = []
 num_cols = []
 weight_col = None
-bad_col = None
-cat_filters = {}
+bad_numerator_col = None
+bad_denominator_col = None
 
 if df is not None:
     auto_date, auto_rule, auto_cat, auto_num = detect_column_types(df)
@@ -271,11 +336,17 @@ if df is not None:
 
         with st.expander("Date Columns", expanded=False):
             date_cols = st.multiselect(
-                "Select date columns", all_cols, default=auto_date, key="cfg_date"
+                "Select date columns",
+                all_cols,
+                default=auto_date,
+                key="cfg_date",
             )
         with st.expander("Rule Columns (binary 0/1)", expanded=False):
             rule_cols = st.multiselect(
-                "Select rule columns", all_cols, default=auto_rule, key="cfg_rule"
+                "Select rule columns",
+                all_cols,
+                default=auto_rule,
+                key="cfg_rule",
             )
         with st.expander("Categorical Columns", expanded=False):
             cat_cols = st.multiselect(
@@ -284,29 +355,32 @@ if df is not None:
                 default=auto_cat,
                 key="cfg_cat",
             )
-        with st.expander("Aggregation & Target", expanded=True):
-            weight_options = ["(None)"] + auto_num
-            wc = st.selectbox(
-                "Weight/Count column (aggregated data)", weight_options, key="cfg_wt"
-            )
-            weight_col = None if wc == "(None)" else wc
-
-            bad_options = ["(None)"] + [
-                c for c in auto_rule + auto_num if c in all_cols
-            ]
-            bc = st.selectbox("Bad/Target column", bad_options, key="cfg_bad")
-            bad_col = None if bc == "(None)" else bc
 
         st.divider()
-        st.header("Categorical Filters")
-        if cat_cols:
-            for col in cat_cols:
-                unique_vals = sorted(df[col].dropna().unique().tolist())
-                sel = st.multiselect(f"{col}", unique_vals, key=f"filt_{col}")
-                if sel:
-                    cat_filters[col] = sel
-        else:
-            st.caption("No categorical columns configured.")
+        st.header("Waterfall Weight")
+        st.caption("For aggregated data where each row represents multiple records.")
+        weight_options = ["(None – 1 per row)"] + auto_num
+        wc = st.selectbox("Weight / Count column", weight_options, key="cfg_wt")
+        weight_col = None if wc.startswith("(None") else wc
+
+        st.divider()
+        st.header("Bad Rate Columns")
+        st.caption(
+            "Numerator = 'bads' to sum; Denominator = 'total' to sum.  "
+            "For **row-level** data pick the 0/1 bad flag as numerator "
+            "and leave denominator as (Row count).  \n"
+            "For **aggregated** data pick the bad-count column and "
+            "the total-count column."
+        )
+        num_denom_options = ["(None)"] + [
+            c for c in (auto_rule + auto_num) if c in all_cols
+        ]
+        bn = st.selectbox("Numerator column (bads)", num_denom_options, key="cfg_num")
+        bad_numerator_col = None if bn == "(None)" else bn
+
+        denom_options = ["(Row count – 1 per row)"] + auto_num
+        bd = st.selectbox("Denominator column (total)", denom_options, key="cfg_den")
+        bad_denominator_col = None if bd.startswith("(Row count") else bd
 
 # ================================================================
 # Main Area
@@ -314,7 +388,9 @@ if df is not None:
 st.title("Rule Waterfall Analyzer")
 
 if df is None:
-    st.info("Upload a Parquet file or generate dummy data from the sidebar to begin.")
+    st.info(
+        "Upload a Parquet file or generate dummy data from the sidebar to begin."
+    )
     st.stop()
 
 # Data preview
@@ -327,16 +403,15 @@ tab_group, tab_wf, tab_br = st.tabs(
 )
 
 # ----------------------------------------------------------------
-# Tab 1: Rule Grouping
+# Tab 1 – Rule Grouping
 # ----------------------------------------------------------------
 with tab_group:
     st.subheader("Configure Rule Groups")
     st.caption(
         "Create groups, assign rules, and order them. Applications are evaluated "
-        "top-to-bottom; once declined by a group, they are excluded from later groups."
+        "top-to-bottom; once declined by a group they are excluded from later groups."
     )
 
-    # Compute assigned / unassigned
     assigned = set()
     for g in st.session_state.groups:
         assigned.update(g["rules"])
@@ -346,7 +421,6 @@ with tab_group:
         f"**{len(unassigned)}** unassigned / **{len(rule_cols)}** total rule columns"
     )
 
-    # Action buttons
     bcol1, bcol2, bcol3 = st.columns(3)
     with bcol1:
         if st.button("Add Group", use_container_width=True):
@@ -364,7 +438,6 @@ with tab_group:
             st.session_state.groups = []
             st.rerun()
 
-    # Render groups
     to_delete = []
     for i, group in enumerate(st.session_state.groups):
         with st.container(border=True):
@@ -386,7 +459,11 @@ with tab_group:
                     gs[i], gs[i - 1] = gs[i - 1], gs[i]
                     st.rerun()
             with cols[3]:
-                if st.button("Dn", key=f"dn_{i}", disabled=(i == len(st.session_state.groups) - 1)):
+                if st.button(
+                    "Dn",
+                    key=f"dn_{i}",
+                    disabled=(i == len(st.session_state.groups) - 1),
+                ):
                     gs = st.session_state.groups
                     gs[i], gs[i + 1] = gs[i + 1], gs[i]
                     st.rerun()
@@ -411,48 +488,41 @@ with tab_group:
             st.session_state.groups.pop(idx)
         st.rerun()
 
-
-# Build ordered groups list
+# Ordered groups (shared by both analysis tabs)
 ordered_groups = [
     (g["name"], g["rules"]) for g in st.session_state.groups if g["rules"]
 ]
 
 # ----------------------------------------------------------------
-# Tab 2: Waterfall
+# Tab 2 – Waterfall Analysis
 # ----------------------------------------------------------------
 with tab_wf:
     if not ordered_groups:
         st.warning("Configure at least one rule group with rules assigned.")
         st.stop()
 
-    st.subheader("Waterfall Date Filter")
-    fc1, fc2, fc3 = st.columns(3)
-    with fc1:
-        wf_date_col_options = ["(None)"] + date_cols
-        wf_dc = st.selectbox("Date column", wf_date_col_options, key="wf_datecol")
-        wf_date_col = None if wf_dc == "(None)" else wf_dc
-    wf_years, wf_quarters = [], []
-    if wf_date_col:
-        dt_s = pd.to_datetime(df[wf_date_col])
-        with fc2:
-            wf_years = st.multiselect(
-                "Year(s)",
-                sorted(dt_s.dt.year.dropna().unique()),
-                key="wf_yr",
-            )
-        with fc3:
-            wf_quarters = st.multiselect("Quarter(s)", [1, 2, 3, 4], key="wf_qt")
+    st.subheader("Waterfall Filters")
+
+    # Date filter
+    wf_date_col, wf_years, wf_quarters = render_date_filter(
+        date_cols, df, "wf"
+    )
+
+    # Categorical filters (independent from bad-rate tab)
+    wf_cat_filters = render_cat_filters(cat_cols, df, "wf_cat")
 
     st.divider()
 
-    # Filter data
+    # Apply filters
     df_wf = filter_by_date(df, wf_date_col, wf_years, wf_quarters)
-    df_wf = filter_by_categories(df_wf, cat_filters)
+    df_wf = filter_by_categories(df_wf, wf_cat_filters)
 
     if len(df_wf) == 0:
         st.warning("No data matches the current filters.")
     else:
-        results_wf, total_pop = compute_waterfall(df_wf, ordered_groups, weight_col)
+        results_wf, total_pop = compute_waterfall(
+            df_wf, ordered_groups, weight_col
+        )
         approved = results_wf[-1]
         total_declined = total_pop - approved["count"]
 
@@ -476,65 +546,79 @@ with tab_wf:
         st.subheader("Detail Table")
         detail = pd.DataFrame(results_wf)
         detail.columns = ["Group", "Declined Count", "Declined %"]
-        detail["Declined Count"] = detail["Declined Count"].map(lambda x: f"{x:,.0f}")
+        detail["Declined Count"] = detail["Declined Count"].map(
+            lambda x: f"{x:,.0f}"
+        )
         detail["Declined %"] = detail["Declined %"].map(lambda x: f"{x:.2f}%")
         st.dataframe(detail, use_container_width=True, hide_index=True)
 
 # ----------------------------------------------------------------
-# Tab 3: Bad Rate
+# Tab 3 – Bad Rate Analysis
 # ----------------------------------------------------------------
 with tab_br:
     if not ordered_groups:
         st.warning("Configure at least one rule group with rules assigned.")
         st.stop()
-    if not bad_col:
-        st.warning("Select a Bad/Target column in the sidebar Column Configuration.")
+    if not bad_numerator_col:
+        st.warning(
+            "Select a **Numerator column** (bads) in the sidebar "
+            "Bad Rate Columns section."
+        )
         st.stop()
 
-    st.subheader("Bad Rate Date Filter")
-    bc1, bc2, bc3 = st.columns(3)
-    with bc1:
-        br_date_col_options = ["(None)"] + date_cols
-        br_dc = st.selectbox("Date column", br_date_col_options, key="br_datecol")
-        br_date_col = None if br_dc == "(None)" else br_dc
-    br_years, br_quarters = [], []
-    if br_date_col:
-        dt_s = pd.to_datetime(df[br_date_col])
-        with bc2:
-            br_years = st.multiselect(
-                "Year(s)",
-                sorted(dt_s.dt.year.dropna().unique()),
-                key="br_yr",
-            )
-        with bc3:
-            br_quarters = st.multiselect("Quarter(s)", [1, 2, 3, 4], key="br_qt")
+    st.subheader("Bad Rate Filters")
+
+    # Date filter (independent)
+    br_date_col, br_years, br_quarters = render_date_filter(
+        date_cols, df, "br"
+    )
+
+    # Categorical filters (independent from waterfall tab)
+    br_cat_filters = render_cat_filters(cat_cols, df, "br_cat")
 
     st.divider()
 
+    # Show which columns are being used
+    denom_label = bad_denominator_col if bad_denominator_col else "Row count"
+    st.caption(
+        f"Bad Rate = **sum({bad_numerator_col})** / **sum({denom_label})** × 100"
+    )
+
+    # Apply filters
     df_br = filter_by_date(df, br_date_col, br_years, br_quarters)
-    df_br = filter_by_categories(df_br, cat_filters)
+    df_br = filter_by_categories(df_br, br_cat_filters)
 
     if len(df_br) == 0:
         st.warning("No data matches the current filters.")
     else:
-        results_br = compute_bad_rates(df_br, ordered_groups, bad_col, weight_col)
+        results_br = compute_bad_rates(
+            df_br, ordered_groups, bad_numerator_col, bad_denominator_col
+        )
 
-        overall_total = sum(r["total"] for r in results_br)
-        overall_bads = sum(r["bads"] for r in results_br)
-        overall_rate = overall_bads / overall_total * 100 if overall_total else 0
+        overall_num = sum(r["numerator"] for r in results_br)
+        overall_den = sum(r["denominator"] for r in results_br)
+        overall_rate = overall_num / overall_den * 100 if overall_den else 0
 
         m1, m2, m3 = st.columns(3)
-        m1.metric("Total Records", f"{overall_total:,.0f}")
-        m2.metric("Total Bads", f"{overall_bads:,.0f}")
+        m1.metric("Total (denominator)", f"{overall_den:,.0f}")
+        m2.metric("Bads (numerator)", f"{overall_num:,.0f}")
         m3.metric("Overall Bad Rate", f"{overall_rate:.2f}%")
 
-        st.plotly_chart(plot_bad_rates(results_br), use_container_width=True)
+        st.plotly_chart(
+            plot_bad_rates(results_br, bad_numerator_col, denom_label),
+            use_container_width=True,
+        )
 
         st.subheader("Detail Table")
         br_detail = pd.DataFrame(results_br)
-        br_detail.columns = ["Group", "Total", "Bads", "Bad Rate (%)"]
-        br_detail["Total"] = br_detail["Total"].map(lambda x: f"{x:,.0f}")
-        br_detail["Bads"] = br_detail["Bads"].map(lambda x: f"{x:,.0f}")
+        br_detail.columns = [
+            "Group",
+            f"Numerator ({bad_numerator_col})",
+            f"Denominator ({denom_label})",
+            "Bad Rate (%)",
+        ]
+        br_detail.iloc[:, 1] = br_detail.iloc[:, 1].map(lambda x: f"{x:,.0f}")
+        br_detail.iloc[:, 2] = br_detail.iloc[:, 2].map(lambda x: f"{x:,.0f}")
         br_detail["Bad Rate (%)"] = br_detail["Bad Rate (%)"].map(
             lambda x: f"{x:.2f}%"
         )
